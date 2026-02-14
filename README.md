@@ -45,7 +45,7 @@ These files are part of the **SIP Blackbelt Certification** — a hands-on progr
 
 Whether you're a telecom engineer looking to deepen your skills or a developer building voice infrastructure, the SIP Blackbelt gives you the practical knowledge to design, deploy, and troubleshoot production SIP platforms with confidence.
 
-**Learn more and enroll at [sipblackbelt.com](https://sipblackbelt.com)**
+**Learn more and enroll at [sipblackbelt.com](https://voip.school)**
 
 ## License
 
