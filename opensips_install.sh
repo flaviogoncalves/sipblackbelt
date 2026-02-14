@@ -196,8 +196,9 @@ database_url = mysql://opensips:opensipsrw@localhost/opensips
 database_name = opensips
 prompt_name = opensips-cli
 domain = ${SERVER_IP}
+plain_text_passwords = false
 CLICFG
-ok "opensips-cli.cfg written (domain=${SERVER_IP})"
+ok "opensips-cli.cfg written (domain=${SERVER_IP}, plain_text_passwords=false)"
 
 info "Running: opensips-cli -x database create opensips"
 # Pipe empty lines as fallback if CLI still prompts for password
@@ -371,60 +372,19 @@ else
     warn "globals.php not found at ${GLOBALS_FILE}"
 fi
 
-# 2) users tool — SIP subscriber password mode
-#    Path varies by CP version: check both locations
-USERS_CFG=""
-for CANDIDATE in \
-    "${CP_DIR}/config/tools/users/user_management/local.inc.php" \
-    "${CP_DIR}/config/tools/admin/users/local.inc.php"; do
-    if [[ -f "$CANDIDATE" ]]; then
-        USERS_CFG="$CANDIDATE"
-        break
-    fi
-done
-
-if [[ -n "$USERS_CFG" ]]; then
-    info "Found users tool config: $USERS_CFG"
-    if grep -q 'passwd_mode' "$USERS_CFG"; then
-        sed -i "s/\$config->passwd_mode\s*=\s*[0-9]/\$config->passwd_mode = 1/" "$USERS_CFG"
-    else
-        # Append before closing PHP tag, or at end if no closing tag
-        if grep -q '^\?>' "$USERS_CFG"; then
-            sed -i '/^\?>$/i \$config->passwd_mode = 1;' "$USERS_CFG"
-        else
-            echo '$config->passwd_mode = 1;' >> "$USERS_CFG"
-        fi
-    fi
-    ok "$(basename $(dirname $USERS_CFG))/local.inc.php: passwd_mode = 1 (HA1)"
+# 2) SIP subscriber password mode — CP 9.3.3+ stores this in ocp_tools_config table
+#    (local.inc.php files are deprecated since CP 9.3.2)
+info "Setting passwd_mode=1 in ocp_tools_config (database)..."
+if mysql -Dopensips -e "SELECT 1 FROM ocp_tools_config WHERE module='user_management' AND param='passwd_mode'" 2>/dev/null | grep -q 1; then
+    mysql -Dopensips -e "UPDATE ocp_tools_config SET value='1' WHERE module='user_management' AND param='passwd_mode';"
+    ok "ocp_tools_config: passwd_mode updated to 1 (HA1)"
 else
-    # Neither path exists — find and create in whichever directory structure exists
-    for CANDIDATE_DIR in \
-        "${CP_DIR}/config/tools/users/user_management" \
-        "${CP_DIR}/config/tools/admin/users"; do
-        if [[ -d "$(dirname "$CANDIDATE_DIR")" ]]; then
-            USERS_CFG="${CANDIDATE_DIR}/local.inc.php"
-            break
-        fi
-    done
-    if [[ -z "$USERS_CFG" ]]; then
-        # Fallback: use the common CP 9.x path
-        USERS_CFG="${CP_DIR}/config/tools/users/user_management/local.inc.php"
-    fi
-    warn "users local.inc.php not found — creating: $USERS_CFG"
-    mkdir -p "$(dirname "$USERS_CFG")"
-    cat > "$USERS_CFG" << 'USRCFG'
-<?php
-// SIP user password mode: 0 = plaintext, 1 = HA1 hash
-$config->passwd_mode = 1;
-?>
-USRCFG
-    chown www-data:www-data "$USERS_CFG"
-    ok "Created: $USERS_CFG (passwd_mode = 1)"
+    mysql -Dopensips -e "INSERT INTO ocp_tools_config (module, param, value) VALUES ('user_management', 'passwd_mode', '1');"
+    ok "ocp_tools_config: passwd_mode inserted as 1 (HA1)"
 fi
 
 info "CP password verification:"
-grep -n 'passwd_mode' "$GLOBALS_FILE" 2>/dev/null || true
-grep -n 'passwd_mode' "$USERS_CFG" 2>/dev/null || true
+mysql -Dopensips -e "SELECT module, param, value FROM ocp_tools_config WHERE param='passwd_mode';"
 
 # ═══════════════════════════════════════════════════════════════
 #  PART 4 — Install Residential Config (AUTH + DBUSRLOC + NAT)
