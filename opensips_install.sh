@@ -2,9 +2,14 @@
 set -euo pipefail
 
 # ============================================================
-# OpenSIPS 3.6 — Complete Installation Script
+# OpenSIPS 3.6 — Complete Installation Script (Multi-Distro)
 # ============================================================
-# Installs everything on Debian 12 (Bookworm):
+# Supports:
+#   • Debian 12 (Bookworm)
+#   • Ubuntu 24.04 (Noble Numbat)
+#
+# NOT supported:
+#   • Debian 13 (Trixie) — failed testing (SQLAlchemy 2.x, libpcre3 conflicts)
 #
 #   PART 1 — OpenSIPS 3.6 + CLI + all modules
 #   PART 2 — MariaDB + opensips database
@@ -47,12 +52,68 @@ fail() {
 # — Pre-flight checks ————————————————————————————————————————
 [[ $EUID -ne 0 ]] && fail "This script must be run as root. Use: sudo bash $0"
 
-if [[ ! -f /etc/debian_version ]]; then
-    fail "This script requires Debian 12 (Bookworm)"
-fi
+# ═══════════════════════════════════════════════════════════════
+#  OS Detection — auto-detect distro, codename, PHP version
+# ═══════════════════════════════════════════════════════════════
 
-DEBIAN_VER=$(cat /etc/debian_version)
-info "Detected Debian version: ${DEBIAN_VER}"
+detect_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        fail "Cannot detect OS — /etc/os-release not found"
+    fi
+
+    . /etc/os-release
+
+    DISTRO_ID="${ID,,}"         # debian or ubuntu (lowercased)
+    DISTRO_VER="${VERSION_ID}"  # 12, 24.04
+    DISTRO_CODENAME="${VERSION_CODENAME:-unknown}"
+    DISTRO_PRETTY="${PRETTY_NAME}"
+
+    case "${DISTRO_ID}" in
+        debian)
+            case "${DISTRO_VER}" in
+                12)
+                    OPENSIPS_REPO_CODENAME="bookworm"
+                    PHP_VER="8.2"
+                    NCURSES_PKG="libncurses5-dev"
+                    ;;
+                13)
+                    fail "Debian 13 (Trixie) is NOT supported. Testing revealed multiple dependency conflicts (SQLAlchemy 2.x, libpcre3 removal). Please use Debian 12 (Bookworm) or Ubuntu 24.04 (Noble) instead."
+                    ;;
+                *)
+                    fail "Unsupported Debian version: ${DISTRO_VER}. Supported: Debian 12 (Bookworm). Note: Debian 13 (Trixie) failed testing due to dependency conflicts."
+                    ;;
+            esac
+            ;;
+        ubuntu)
+            case "${DISTRO_VER}" in
+                24.04)
+                    OPENSIPS_REPO_CODENAME="noble"
+                    PHP_VER="8.3"
+                    NCURSES_PKG="libncurses-dev"
+                    ;;
+                *)
+                    fail "Unsupported Ubuntu version: ${DISTRO_VER}. Supported: 24.04"
+                    ;;
+            esac
+            ;;
+        *)
+            fail "Unsupported distribution: ${DISTRO_ID}. Supported: debian, ubuntu"
+            ;;
+    esac
+
+    # PHP package names derived from version
+    PHP_MYSQL_PKG="php${PHP_VER}-mysql"
+    PHP_MOD_APACHE="php${PHP_VER}"
+
+    info "Detected: ${DISTRO_PRETTY}"
+    info "  Distro ID:      ${DISTRO_ID}"
+    info "  Version:        ${DISTRO_VER} (${DISTRO_CODENAME})"
+    info "  OpenSIPS repo:  ${OPENSIPS_REPO_CODENAME}"
+    info "  PHP version:    ${PHP_VER}"
+    info "  ncurses pkg:    ${NCURSES_PKG}"
+}
+
+detect_os
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 info "Server IP: ${SERVER_IP}"
@@ -67,20 +128,28 @@ apt-get upgrade -y
 ok "System updated"
 
 step "Install Prerequisites"
-apt-get install -y wget gnupg2 curl software-properties-common git m4 libncurses5-dev python3-pymysql
+# python3-pymysql needed by opensips-cli for MySQL connectivity
+PREREQS="wget gnupg2 curl git m4 ${NCURSES_PKG} python3-pymysql lsb-release"
+
+# software-properties-common is Ubuntu-only (provides add-apt-repository)
+if [[ "${DISTRO_ID}" == "ubuntu" ]]; then
+    PREREQS="${PREREQS} software-properties-common"
+fi
+
+apt-get install -y ${PREREQS}
 ok "Prerequisites installed"
 
 step "Add OpenSIPS 3.6 Repositories"
 curl -fsSL https://apt.opensips.org/opensips-org.gpg -o /usr/share/keyrings/opensips-org.gpg
 
-echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm 3.6-releases" \
+echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org ${OPENSIPS_REPO_CODENAME} 3.6-releases" \
     > /etc/apt/sources.list.d/opensips.list
 
-echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org bookworm cli-nightly" \
+echo "deb [signed-by=/usr/share/keyrings/opensips-org.gpg] https://apt.opensips.org ${OPENSIPS_REPO_CODENAME} cli-nightly" \
     > /etc/apt/sources.list.d/opensips-cli.list
 
 apt-get update -y
-ok "OpenSIPS repositories added"
+ok "OpenSIPS repositories added (codename: ${OPENSIPS_REPO_CODENAME})"
 
 step "Install OpenSIPS 3.6"
 apt-get install -y opensips
@@ -131,13 +200,13 @@ info "Running: opensips-cli -x database create opensips"
 # Pipe empty lines as fallback if CLI still prompts for password
 (echo ""; echo ""; echo "") | opensips-cli -x database create opensips 2>&1 || {
     warn "opensips-cli database create returned non-zero — trying direct MySQL creation..."
-    
+
     # Direct MySQL fallback: create DB, user, and import schema manually
     mysql -e "CREATE DATABASE IF NOT EXISTS opensips;"
     mysql -e "CREATE USER IF NOT EXISTS 'opensips'@'localhost' IDENTIFIED BY 'opensipsrw';"
     mysql -e "GRANT ALL PRIVILEGES ON opensips.* TO 'opensips'@'localhost';"
     mysql -e "FLUSH PRIVILEGES;"
-    
+
     # Import OpenSIPS standard tables
     SCHEMA_DIR="/usr/share/opensips"
     if [[ -d "$SCHEMA_DIR/mysql" ]]; then
@@ -164,23 +233,25 @@ ok "${TABLE_COUNT} tables found in opensips database"
 #  PART 3 — Apache + PHP + OpenSIPS Control Panel
 # ═══════════════════════════════════════════════════════════════
 
-step "Install Apache & PHP"
+step "Install Apache & PHP ${PHP_VER}"
+
+# Install Apache + PHP + the version-specific MySQL extension
 apt-get install -y apache2 libapache2-mod-php php-curl php php-mysql \
-    php-gd php-pear php-cli php-apcu php8.2-mysql
+    php-gd php-pear php-cli php-apcu "${PHP_MYSQL_PKG}"
 
 # Ensure PDO MySQL is enabled (critical for OpenSIPS CP)
 phpenmod pdo_mysql
 phpenmod mysqli
 
 a2enmod rewrite
-a2enmod php8.2
+a2enmod "php${PHP_VER}" || warn "php${PHP_VER} module may not need explicit enabling"
 a2enmod headers
 
 sed -i 's/^Listen .*/Listen 0.0.0.0:80/' /etc/apache2/ports.conf
 
 systemctl enable apache2
 systemctl start apache2
-ok "Apache + PHP installed (pdo_mysql enabled)"
+ok "Apache + PHP ${PHP_VER} installed (pdo_mysql enabled)"
 
 step "Download OpenSIPS Control Panel 9.3.5"
 cd /var/www/html
@@ -282,102 +353,132 @@ systemctl restart cron
 ok "Permissions set + monitoring cron installed"
 
 # ═══════════════════════════════════════════════════════════════
-#  PART 4 — Generate Residential Script
+#  PART 4 — Install Residential Config (AUTH + DBUSRLOC + NAT)
 # ═══════════════════════════════════════════════════════════════
 
 step "Backup Current OpenSIPS Config"
 cp /etc/opensips/opensips.cfg /etc/opensips/opensips.cfg.orig
 ok "Backup saved: /etc/opensips/opensips.cfg.orig"
 
-step "Generate Residential Script (USE_AUTH, USE_DBUSRLOC, USE_NAT)"
-info "Using m4 templates to generate residential config..."
+step "Install Residential Config (USE_AUTH, USE_DBUSRLOC, USE_NAT)"
+info "Writing opensips.cfg with AUTH + DB_USRLOC + NAT + RTPProxy..."
 
-M4_TEMPLATE_DIR="/usr/share/opensips/menuconfig_templates"
-M4_DEF_FILE="${M4_TEMPLATE_DIR}/opensips_residential_def.m4"
-M4_TEMPLATE="${M4_TEMPLATE_DIR}/opensips_residential.m4"
+GENERATED_CFG="/etc/opensips/opensips_residential_$(date +%Y-%m-%d_%H%M%S).cfg"
 
-if [[ ! -f "$M4_DEF_FILE" ]] || [[ ! -f "$M4_TEMPLATE" ]]; then
-    fail "M4 templates not found at ${M4_TEMPLATE_DIR}. Is opensips installed?"
-fi
+cat > "$GENERATED_CFG" << OPENSIPS_CFG
+#
+# OpenSIPS 3.6 — Residential Configuration
+# Generated by opensips_install.sh
+# Features: AUTH, DBUSRLOC, NAT, RTPProxy, HTTPD/MI_HTTP
+#
 
-# Backup original m4 defaults
-cp "$M4_DEF_FILE" "${M4_DEF_FILE}.bak"
+####### Global Parameters #########
 
-# Enable the required features in the defaults file
-sed -i "s/define(\`USE_AUTH', \`no')/define(\`USE_AUTH', \`yes')/" "$M4_DEF_FILE"
-sed -i "s/define(\`USE_DBUSRLOC', \`no')/define(\`USE_DBUSRLOC', \`yes')/" "$M4_DEF_FILE"
-sed -i "s/define(\`USE_NAT', \`no')/define(\`USE_NAT', \`yes')/" "$M4_DEF_FILE"
+#debug_mode=yes
 
-info "Enabled: USE_AUTH, USE_DBUSRLOC, USE_NAT"
+log_level=3
+xlog_level=3
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
 
-# Generate the residential config with m4
-GENERATED_CFG="/etc/opensips/opensips_residential_$(date +%Y-%m-%d_%H:%M:%S).cfg"
-m4 "$M4_TEMPLATE" > "$GENERATED_CFG"
+udp_workers=4
 
-# Restore original m4 defaults
-mv "${M4_DEF_FILE}.bak" "$M4_DEF_FILE"
+/* uncomment the next line to enable the auto temporary blacklisting of
+   not available destinations (default disabled) */
+#disable_dns_blacklist=no
 
-if [[ ! -s "$GENERATED_CFG" ]]; then
-    fail "Generated config is empty. Check m4 templates."
-fi
+/* uncomment the next line to enable IPv6 lookup after IPv4 dns
+   lookup failures (default disabled) */
+#dns_try_ipv6=yes
 
-ok "Generated: ${GENERATED_CFG}"
 
-step "Install & Configure Generated Config"
-info "Installing generated config as active opensips.cfg..."
-cp "$GENERATED_CFG" /etc/opensips/opensips.cfg
-chmod 644 /etc/opensips/opensips.cfg
+socket=udp:${SERVER_IP}:5060
 
-info "Post-generation edits..."
 
-# Update socket addresses: 127.0.0.1 → SERVER_IP
-info "Replacing 127.0.0.1 with ${SERVER_IP} in socket lines..."
+####### Modules Section ########
 
-# Replace 127.0.0.1 in any socket= line (handles any spacing/comments)
-sed -i "/^[[:space:]]*socket=/{s/127\.0\.0\.1/${SERVER_IP}/g}" /etc/opensips/opensips.cfg
+#set module path
+mpath="/usr/lib/x86_64-linux-gnu/opensips/modules/"
 
-# Verify the changes were applied
-info "Socket lines after update:"
-grep -n '^[[:space:]]*socket=' /etc/opensips/opensips.cfg || warn "No socket= lines found"
+#### SIGNALING module
+loadmodule "signaling.so"
 
-# If no socket lines exist, add them
-if ! grep -q '^[[:space:]]*socket=' /etc/opensips/opensips.cfg; then
-    warn "No socket= lines found — adding them manually"
-    sed -i "/^####### Global Parameters/a\\
-socket=udp:${SERVER_IP}:5060\\
-socket=tcp:${SERVER_IP}:5060" /etc/opensips/opensips.cfg
-    ok "Socket lines added manually"
-fi
+#### StateLess module
+loadmodule "sl.so"
 
-info "Configured socket addresses for ${SERVER_IP}"
+#### Transaction Module
+loadmodule "tm.so"
+modparam("tm", "fr_timeout", 5)
+modparam("tm", "fr_inv_timeout", 30)
+modparam("tm", "restart_fr_on_each_reply", 0)
+modparam("tm", "onreply_avp_mode", 1)
 
-# Configure rtpproxy socket in the database
-mysql -Dopensips -e "DELETE FROM rtpproxy_sockets WHERE set_id=1;" 2>/dev/null || true
-mysql -Dopensips -e "INSERT INTO rtpproxy_sockets (set_id, rtpproxy_sock) VALUES (1, 'udp:127.0.0.1:7899');"
-ok "RTPProxy socket configured in database: udp:127.0.0.1:7899"
+#### Record Route Module
+loadmodule "rr.so"
+/* do not append from tag to the RR (no need for this script) */
+modparam("rr", "append_fromtag", 0)
 
-# Switch to HA1 hash authentication (more secure)
-sed -i 's|modparam("auth_db", "calculate_ha1", yes)|modparam("auth_db", "calculate_ha1", no)|' /etc/opensips/opensips.cfg
-sed -i 's|modparam("auth_db", "password_column", "password")|modparam("auth_db", "password_column", "ha1")|' /etc/opensips/opensips.cfg
-info "Switched to HA1 hash authentication"
+#### MAX ForWarD module
+loadmodule "maxfwd.so"
 
-# Add HTTPD + MI_HTTP modules for Control Panel communication
-info "Adding httpd + mi_http modules for Control Panel..."
-# Find the last loadmodule line and append after it
-LAST_LOADMOD=$(grep -n '^loadmodule' /etc/opensips/opensips.cfg | tail -1 | cut -d: -f1)
-if [[ -n "$LAST_LOADMOD" ]]; then
-    sed -i "${LAST_LOADMOD}a\\
-\\
-#### HTTPD + MI_HTTP for Control Panel\\
-loadmodule \"httpd.so\"\\
-modparam(\"httpd\", \"port\", 8888)\\
-\\
-loadmodule \"mi_http.so\"\\
-modparam(\"mi_http\", \"root\", \"json\")" /etc/opensips/opensips.cfg
-    ok "httpd (port 8888) + mi_http modules added to opensips.cfg"
-else
-    warn "Could not find loadmodule lines — adding httpd at end of module section"
-    cat >> /etc/opensips/opensips.cfg << 'HTTPD_BLOCK'
+#### SIP MSG OPerationS module
+loadmodule "sipmsgops.so"
+
+#### FIFO Management Interface
+loadmodule "mi_fifo.so"
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+
+#### MYSQL module
+loadmodule "db_mysql.so"
+
+#### USeR LOCation module
+loadmodule "usrloc.so"
+modparam("usrloc", "nat_bflag", "NAT")
+modparam("usrloc", "working_mode_preset", "single-instance-sql-write-back")
+modparam("usrloc", "db_url",
+	"mysql://opensips:opensipsrw@localhost/opensips") # CUSTOMIZE ME
+
+
+#### REGISTRAR module
+loadmodule "registrar.so"
+modparam("registrar", "tcp_persistent_flag", "TCP_PERSISTENT")
+modparam("registrar", "received_avp", "\$avp(received_nh)")
+/* uncomment the next line not to allow more than 10 contacts per AOR */
+#modparam("registrar", "max_contacts", 10)
+
+#### ACCounting module
+loadmodule "acc.so"
+/* what special events should be accounted ? */
+modparam("acc", "early_media", 0)
+modparam("acc", "report_cancels", 0)
+/* by default we do not adjust the direct of the sequential requests.
+   if you enable this parameter, be sure to enable "append_fromtag"
+   in "rr" module */
+modparam("acc", "detect_direction", 0)
+
+#### AUTHentication modules
+loadmodule "auth.so"
+loadmodule "auth_db.so"
+modparam("auth_db", "calculate_ha1", no)
+modparam("auth_db", "password_column", "ha1")
+modparam("auth_db", "db_url",
+	"mysql://opensips:opensipsrw@localhost/opensips") # CUSTOMIZE ME
+modparam("auth_db", "load_credentials", "")
+
+####  NAT modules
+loadmodule "nathelper.so"
+modparam("nathelper", "natping_interval", 10)
+modparam("nathelper", "ping_nated_only", 1)
+modparam("nathelper", "sipping_bflag", "SIP_PING_FLAG")
+modparam("nathelper", "sipping_from", "sip:pinger@${SERVER_IP}")
+modparam("nathelper", "received_avp", "\$avp(received_nh)")
+
+loadmodule "rtpproxy.so"
+modparam("rtpproxy", "rtpproxy_sock", "udp:localhost:7899")
+
+loadmodule "proto_udp.so"
 
 #### HTTPD + MI_HTTP for Control Panel
 loadmodule "httpd.so"
@@ -385,33 +486,349 @@ modparam("httpd", "port", 8888)
 
 loadmodule "mi_http.so"
 modparam("mi_http", "root", "json")
-HTTPD_BLOCK
-    ok "httpd + mi_http appended to config"
-fi
 
-grep -n '^socket=\|calculate_ha1\|password_column' /etc/opensips/opensips.cfg || true
-ok "Config installed and customized"
+
+####### Routing Logic ########
+
+# main request routing logic
+
+route{
+
+	# initial NAT handling; detect if the request comes from behind a NAT
+	# and apply contact fixing
+	force_rport();
+	if (nat_uac_test("diff-port-src-via,private-via,diff-ip-src-via,private-contact")) {
+		if (is_method("REGISTER")) {
+			fix_nated_register();
+			setbflag("NAT");
+		} else {
+			fix_nated_contact();
+			setflag("NAT");
+		}
+	}
+
+	if (!mf_process_maxfwd_header(10)) {
+		send_reply(483,"Too Many Hops");
+		exit;
+	}
+
+	if (has_totag()) {
+
+		# handle hop-by-hop ACK (no routing required)
+		if ( is_method("ACK") && t_check_trans() ) {
+			t_relay();
+			exit;
+		}
+
+		# sequential request within a dialog should
+		# take the path determined by record-routing
+		if ( !loose_route() ) {
+			# we do record-routing for all our traffic, so we should not
+			# receive any sequential requests without Route hdr.
+			send_reply(404,"Not here");
+			exit;
+		}
+
+		if (is_method("BYE")) {
+			# do accounting even if the transaction fails
+			do_accounting("log","failed");
+		}
+
+		if (check_route_param("nat=yes"))
+			setflag("NAT");
+		# route it out to whatever destination was set by loose_route()
+		# in \$du (destination URI).
+		route(relay);
+		exit;
+	}
+
+	# CANCEL processing
+	if (is_method("CANCEL")) {
+		if (t_check_trans())
+			t_relay();
+		exit;
+	}
+
+	# absorb retransmissions, but do not create transaction
+	t_check_trans();
+
+	if ( !(is_method("REGISTER")  ) ) {
+
+		if (is_myself("\$fd")) {
+
+			# authenticate if from local subscriber
+			# authenticate all initial non-REGISTER request that pretend to be
+			# generated by local subscriber (domain from FROM URI is local)
+			if (!proxy_authorize("", "subscriber")) {
+				proxy_challenge("", "auth");
+				exit;
+			}
+			if (\$au!=\$fU) {
+				send_reply(403,"Forbidden auth ID");
+				exit;
+			}
+
+			consume_credentials();
+			# caller authenticated
+
+		} else {
+			# if caller is not local, then called number must be local
+
+			if (!is_myself("\$rd")) {
+				send_reply(403,"Relay Forbidden");
+				exit;
+			}
+		}
+
+	}
+
+	# preloaded route checking
+	if (loose_route()) {
+		xlog("L_ERR",
+			"Attempt to route with preloaded Route's [\$fu/\$tu/\$ru/\$ci]");
+		if (!is_method("ACK"))
+			send_reply(403,"Preload Route denied");
+		exit;
+	}
+
+	# record routing
+	if (!is_method("REGISTER|MESSAGE"))
+		record_route();
+
+	# account only INVITEs
+	if (is_method("INVITE")) {
+		do_accounting("log");
+	}
+
+	if (!is_myself("\$rd")) {
+		append_hf("P-hint: outbound\r\n");
+		route(relay);
+	}
+
+	# requests for my domain
+
+	if (is_method("PUBLISH|SUBSCRIBE")) {
+		send_reply(503, "Service Unavailable");
+		exit;
+	}
+
+	if (is_method("REGISTER")) {
+		# authenticate the REGISTER requests
+		if (!www_authorize("", "subscriber")) {
+			www_challenge("", "auth");
+			exit;
+		}
+
+		if (\$au!=\$tU) {
+			send_reply(403,"Forbidden auth ID");
+			exit;
+		}
+
+		if (isflagset("NAT")) {
+			setbflag("SIP_PING_FLAG");
+		}
+
+		# store the registration and generate a SIP reply
+		if (!save("location"))
+			xlog("failed to register AoR \$tu\n");
+
+		exit;
+	}
+
+	if (\$rU==NULL) {
+		# request with no Username in RURI
+		send_reply(484,"Address Incomplete");
+		exit;
+	}
+
+	# do lookup with method filtering
+	if (!lookup("location", "method-filtering")) {
+		if (!db_does_uri_exist("\$ru","subscriber")) {
+			send_reply(420,"Bad Extension");
+			exit;
+		}
+
+		t_reply(404, "Not Found");
+		exit;
+	}
+
+	if (isbflagset("NAT")) setflag("NAT");
+
+	# when routing via usrloc, log the missed calls also
+	do_accounting("log","missed");
+	route(relay);
+}
+
+
+route[relay] {
+	# for INVITEs enable some additional helper routes
+	if (is_method("INVITE")) {
+
+		if (isflagset("NAT") && has_body("application/sdp")) {
+			rtpproxy_offer("ro");
+		}
+
+		t_on_branch("per_branch_ops");
+		t_on_reply("handle_nat");
+		t_on_failure("missed_call");
+	}
+
+	if (isflagset("NAT")) {
+		add_rr_param(";nat=yes");
+	}
+
+	if (!t_relay()) {
+		send_reply(500,"Internal Error");
+	}
+	exit;
+}
+
+
+branch_route[per_branch_ops] {
+	xlog("new branch at \$ru\n");
+}
+
+
+onreply_route[handle_nat] {
+	if (nat_uac_test("private-contact"))
+		fix_nated_contact();
+	if ( isflagset("NAT") && has_body("application/sdp") )
+		rtpproxy_answer("ro");
+	xlog("incoming reply\n");
+}
+
+
+failure_route[missed_call] {
+	if (t_was_cancelled()) {
+		exit;
+	}
+
+	# uncomment the following lines if you want to block client
+	# redirect based on 3xx replies.
+	##if (t_check_status("3[0-9][0-9]")) {
+	##t_reply(404,"Not found");
+	##	exit;
+	##}
+}
+OPENSIPS_CFG
+
+ok "Residential config written: ${GENERATED_CFG}"
+
+# Install as active config
+cp "$GENERATED_CFG" /etc/opensips/opensips.cfg
+chmod 644 /etc/opensips/opensips.cfg
+ok "Installed as /etc/opensips/opensips.cfg"
+
+# Verify the config has required modules
+info "Verifying config modules..."
+for MODULE in "auth_db.so" "usrloc.so" "nathelper.so" "rtpproxy.so" "httpd.so" "mi_http.so"; do
+    if grep -q "$MODULE" /etc/opensips/opensips.cfg; then
+        ok "  Found: $MODULE"
+    else
+        error "  Missing: $MODULE"
+    fi
+done
+
+# Configure rtpproxy socket in the database
+mysql -Dopensips -e "DELETE FROM rtpproxy_sockets WHERE set_id=1;" 2>/dev/null || true
+mysql -Dopensips -e "INSERT INTO rtpproxy_sockets (set_id, rtpproxy_sock) VALUES (1, 'udp:127.0.0.1:7899');"
+ok "RTPProxy socket configured in database: udp:127.0.0.1:7899"
+
+info "Config summary:"
+grep -n 'socket=\|calculate_ha1\|password_column\|rtpproxy_sock\|httpd.*port' /etc/opensips/opensips.cfg || true
+ok "Config installed and verified"
 
 # ═══════════════════════════════════════════════════════════════
 #  PART 5 — RTPProxy Installation & Configuration
 # ═══════════════════════════════════════════════════════════════
 
 step "Install RTPProxy"
-info "Downloading rtpproxy 1.2.1 from Debian archive..."
+info "Installing rtpproxy..."
 
 cd /tmp
 export PATH="$PATH:/sbin:/usr/sbin"
 
-# Try primary mirror, fallback to secondary
-if ! wget -q --timeout=30 https://archive.debian.org/debian/pool/main/r/rtpproxy/rtpproxy_1.2.1-2.2_amd64.deb 2>/dev/null; then
-    warn "Primary mirror failed, trying secondary..."
-    wget -q --timeout=30 http://ftp.de.debian.org/debian/pool/main/r/rtpproxy/rtpproxy_1.2.1-2.2_amd64.deb 2>/dev/null \
-        || fail "Could not download rtpproxy. Check your internet connection."
+install_rtpproxy_from_deb() {
+    local deb_url="$1"
+    local deb_file="/tmp/rtpproxy.deb"
+
+    info "Downloading rtpproxy from: ${deb_url}"
+    if wget -q --timeout=30 -O "${deb_file}" "${deb_url}" 2>/dev/null; then
+        dpkg -i "${deb_file}" 2>/dev/null || apt-get install -f -y
+        rm -f "${deb_file}"
+        return 0
+    fi
+    return 1
+}
+
+RTPPROXY_INSTALLED=false
+
+# Strategy 1: Try native apt (works on Debian 12, some older Ubuntu)
+if apt-get install -y rtpproxy 2>/dev/null; then
+    RTPPROXY_INSTALLED=true
+    ok "RTPProxy installed from system repositories"
 fi
 
-dpkg -i /tmp/rtpproxy_1.2.1-2.2_amd64.deb 2>/dev/null || apt-get install -f -y
-rm -f /tmp/rtpproxy_1.2.1-2.2_amd64.deb
-ok "RTPProxy installed"
+# Strategy 2: Download pre-built .deb
+if [[ "$RTPPROXY_INSTALLED" == "false" ]]; then
+    info "rtpproxy not in repos — downloading pre-built .deb..."
+
+    # Primary: Debian archive (works for Debian 12/13 and often Ubuntu)
+    DEB_URL_PRIMARY="https://archive.debian.org/debian/pool/main/r/rtpproxy/rtpproxy_1.2.1-2.2_amd64.deb"
+    # Fallback: Ubuntu jammy (22.04) package
+    DEB_URL_FALLBACK="http://archive.ubuntu.com/ubuntu/pool/universe/r/rtpproxy/rtpproxy_1.2.1-2.2ubuntu1_amd64.deb"
+
+    if install_rtpproxy_from_deb "$DEB_URL_PRIMARY"; then
+        RTPPROXY_INSTALLED=true
+        ok "RTPProxy installed from Debian archive"
+    elif install_rtpproxy_from_deb "$DEB_URL_FALLBACK"; then
+        RTPPROXY_INSTALLED=true
+        ok "RTPProxy installed from Ubuntu archive"
+    fi
+fi
+
+# Strategy 3: Build from source as last resort
+if [[ "$RTPPROXY_INSTALLED" == "false" ]]; then
+    warn "Pre-built .deb not available — building rtpproxy from source..."
+    apt-get install -y build-essential autoconf automake libtool
+
+    cd /tmp
+    if git clone --depth 1 https://github.com/sippy/rtpproxy.git rtpproxy-src; then
+        cd rtpproxy-src
+        git submodule update --init --recursive 2>/dev/null || true
+        autoreconf -fi
+        ./configure
+        make -j"$(nproc)"
+        make install
+        cd /tmp && rm -rf rtpproxy-src
+
+        # Create systemd service for source-built rtpproxy
+        cat > /etc/systemd/system/rtpproxy.service << 'SVCFILE'
+[Unit]
+Description=RTP Proxy
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rtpproxy
+ExecStart=/usr/local/bin/rtpproxy -f -s $CONTROL_SOCK $EXTRA_OPTS
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+SVCFILE
+        systemctl daemon-reload
+        RTPPROXY_INSTALLED=true
+        ok "RTPProxy built and installed from source"
+    else
+        warn "Could not clone rtpproxy source — RTPProxy NOT installed"
+    fi
+fi
+
+if [[ "$RTPPROXY_INSTALLED" == "false" ]]; then
+    warn "RTPProxy installation failed — NAT traversal may not work"
+    warn "You can install it manually later"
+fi
 
 step "Configure RTPProxy"
 cat > /etc/default/rtpproxy << 'RTPCONF'
@@ -423,10 +840,14 @@ RTPCONF
 info "Control socket: udp:127.0.0.1:7899"
 info "Listen address: 0.0.0.0 (all interfaces)"
 
-systemctl stop rtpproxy 2>/dev/null || true
-systemctl start rtpproxy
-systemctl enable rtpproxy 2>/dev/null || true
-ok "RTPProxy configured and running"
+if [[ "$RTPPROXY_INSTALLED" == "true" ]]; then
+    systemctl stop rtpproxy 2>/dev/null || true
+    systemctl start rtpproxy
+    systemctl enable rtpproxy 2>/dev/null || true
+    ok "RTPProxy configured and running"
+else
+    warn "Skipping RTPProxy service start (not installed)"
+fi
 
 # ═══════════════════════════════════════════════════════════════
 #  PART 6 — SIP Users + Restart OpenSIPS
@@ -503,14 +924,19 @@ printf "${C_GREEN}════════════════════�
 printf "${C_GREEN}  ✅  OpenSIPS 3.6 — Complete Installation Done!${C_RESET}\n"
 printf "${C_GREEN}══════════════════════════════════════════════════════════════${C_RESET}\n"
 printf "\n"
+printf "  ${C_CYAN}System:${C_RESET}\n"
+printf "    OS:             ${DISTRO_PRETTY}\n"
+printf "    PHP:            ${PHP_VER}\n"
+printf "    OpenSIPS repo:  ${OPENSIPS_REPO_CODENAME}\n"
+printf "\n"
 printf "  ${C_CYAN}Installed components:${C_RESET}\n"
 printf "    • OpenSIPS 3.6 SIP proxy + all modules\n"
 printf "    • OpenSIPS CLI\n"
 printf "    • MariaDB database server\n"
-printf "    • Apache + PHP 8.2\n"
+printf "    • Apache + PHP ${PHP_VER}\n"
 printf "    • OpenSIPS Control Panel 9.3.5\n"
 printf "    • Residential script (USE_AUTH, USE_DBUSRLOC, USE_NAT)\n"
-printf "    • RTPProxy 1.2.1 (NAT traversal)\n"
+printf "    • RTPProxy (NAT traversal)\n"
 printf "    • SIP users 1000 & 1001\n"
 printf "\n"
 printf "  ${C_CYAN}Access:${C_RESET}\n"
@@ -551,4 +977,26 @@ printf "  ${C_CYAN}Next steps:${C_RESET}\n"
 printf "    • Register softphones with users 1000/1001\n"
 printf "    • Test SIP calls between the two users\n"
 printf "    • Monitor calls in the Control Panel\n"
+printf "\n"
+
+printf "${C_RED}╔════════════════════════════════════════════════════════════╗${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}║   ⚠⚠⚠  SECURITY WARNING — DO NOT USE IN PRODUCTION  ⚠⚠⚠   ║${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}║   This script uses DEFAULT, EASY-TO-GUESS passwords:       ║${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}║     • MySQL opensips user:    opensipsrw                   ║${C_RESET}\n"
+printf "${C_RED}║     • Control Panel login:    admin / opensips             ║${C_RESET}\n"
+printf "${C_RED}║     • SIP users 1000 & 1001:  supersecret                 ║${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}║   Before exposing this server to the internet, you MUST:   ║${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}║     1. Change the MySQL 'opensips' user password           ║${C_RESET}\n"
+printf "${C_RED}║        (update db.inc.php + opensips-cli.cfg too)          ║${C_RESET}\n"
+printf "${C_RED}║     2. Change the Control Panel admin password             ║${C_RESET}\n"
+printf "${C_RED}║     3. Change SIP user passwords (or delete test users)    ║${C_RESET}\n"
+printf "${C_RED}║     4. Configure a firewall (ufw / iptables)              ║${C_RESET}\n"
+printf "${C_RED}║     5. Enable TLS for SIP signaling                       ║${C_RESET}\n"
+printf "${C_RED}║                                                            ║${C_RESET}\n"
+printf "${C_RED}╚════════════════════════════════════════════════════════════╝${C_RESET}\n"
 printf "\n"
