@@ -131,6 +131,9 @@ step "Install Prerequisites"
 # python3-pymysql needed by opensips-cli for MySQL connectivity
 PREREQS="wget gnupg2 curl git m4 ${NCURSES_PKG} python3-pymysql lsb-release"
 
+# SIP troubleshooting & network tools
+PREREQS="${PREREQS} net-tools sngrep ngrep sipsak sipvicious"
+
 # software-properties-common is Ubuntu-only (provides add-apt-repository)
 if [[ "${DISTRO_ID}" == "ubuntu" ]]; then
     PREREQS="${PREREQS} software-properties-common"
@@ -351,6 +354,77 @@ find /var/www/html/opensips-cp/ -type f -exec chmod 644 {} \;
 cp /var/www/html/opensips-cp/config/tools/system/smonitor/opensips_stats_cron /etc/cron.d/
 systemctl restart cron
 ok "Permissions set + monitoring cron installed"
+
+step "Configure Control Panel for HA1 Password Hashing"
+CP_DIR="/var/www/html/opensips-cp"
+
+# 1) globals.php — CP admin login password mode
+GLOBALS_FILE="${CP_DIR}/config/globals.php"
+if [[ -f "$GLOBALS_FILE" ]]; then
+    if grep -q 'admin_passwd_mode' "$GLOBALS_FILE"; then
+        sed -i "s/\$config->admin_passwd_mode\s*=\s*[0-9]/\$config->admin_passwd_mode = 1/" "$GLOBALS_FILE"
+    else
+        sed -i '/^\?>$/i \$config->admin_passwd_mode = 1;' "$GLOBALS_FILE"
+    fi
+    ok "globals.php: admin_passwd_mode = 1 (HA1)"
+else
+    warn "globals.php not found at ${GLOBALS_FILE}"
+fi
+
+# 2) users tool — SIP subscriber password mode
+#    Path varies by CP version: check both locations
+USERS_CFG=""
+for CANDIDATE in \
+    "${CP_DIR}/config/tools/users/user_management/local.inc.php" \
+    "${CP_DIR}/config/tools/admin/users/local.inc.php"; do
+    if [[ -f "$CANDIDATE" ]]; then
+        USERS_CFG="$CANDIDATE"
+        break
+    fi
+done
+
+if [[ -n "$USERS_CFG" ]]; then
+    info "Found users tool config: $USERS_CFG"
+    if grep -q 'passwd_mode' "$USERS_CFG"; then
+        sed -i "s/\$config->passwd_mode\s*=\s*[0-9]/\$config->passwd_mode = 1/" "$USERS_CFG"
+    else
+        # Append before closing PHP tag, or at end if no closing tag
+        if grep -q '^\?>' "$USERS_CFG"; then
+            sed -i '/^\?>$/i \$config->passwd_mode = 1;' "$USERS_CFG"
+        else
+            echo '$config->passwd_mode = 1;' >> "$USERS_CFG"
+        fi
+    fi
+    ok "$(basename $(dirname $USERS_CFG))/local.inc.php: passwd_mode = 1 (HA1)"
+else
+    # Neither path exists — find and create in whichever directory structure exists
+    for CANDIDATE_DIR in \
+        "${CP_DIR}/config/tools/users/user_management" \
+        "${CP_DIR}/config/tools/admin/users"; do
+        if [[ -d "$(dirname "$CANDIDATE_DIR")" ]]; then
+            USERS_CFG="${CANDIDATE_DIR}/local.inc.php"
+            break
+        fi
+    done
+    if [[ -z "$USERS_CFG" ]]; then
+        # Fallback: use the common CP 9.x path
+        USERS_CFG="${CP_DIR}/config/tools/users/user_management/local.inc.php"
+    fi
+    warn "users local.inc.php not found — creating: $USERS_CFG"
+    mkdir -p "$(dirname "$USERS_CFG")"
+    cat > "$USERS_CFG" << 'USRCFG'
+<?php
+// SIP user password mode: 0 = plaintext, 1 = HA1 hash
+$config->passwd_mode = 1;
+?>
+USRCFG
+    chown www-data:www-data "$USERS_CFG"
+    ok "Created: $USERS_CFG (passwd_mode = 1)"
+fi
+
+info "CP password verification:"
+grep -n 'passwd_mode' "$GLOBALS_FILE" 2>/dev/null || true
+grep -n 'passwd_mode' "$USERS_CFG" 2>/dev/null || true
 
 # ═══════════════════════════════════════════════════════════════
 #  PART 4 — Install Residential Config (AUTH + DBUSRLOC + NAT)
@@ -864,6 +938,14 @@ fi
 systemctl restart opensips
 ok "OpenSIPS restarted with residential config"
 
+step "Add SIP Domain"
+mysql -Dopensips -e "DELETE FROM domain WHERE domain='${SERVER_IP}';" 2>/dev/null || true
+mysql -Dopensips -e "INSERT INTO domain (domain) VALUES ('${SERVER_IP}');"
+ok "Domain '${SERVER_IP}' added to domain table"
+
+info "Domains in database:"
+mysql -Dopensips -e 'SELECT * FROM domain'
+
 step "Add SIP Users"
 opensips-cli -x user add 1000@${SERVER_IP} supersecret || warn "User 1000 may already exist"
 ok "User 1000@${SERVER_IP} processed"
@@ -938,6 +1020,7 @@ printf "    • OpenSIPS Control Panel 9.3.5\n"
 printf "    • Residential script (USE_AUTH, USE_DBUSRLOC, USE_NAT)\n"
 printf "    • RTPProxy (NAT traversal)\n"
 printf "    • SIP users 1000 & 1001\n"
+printf "    • Troubleshooting tools: sngrep, ngrep, sipsak, sipvicious\n"
 printf "\n"
 printf "  ${C_CYAN}Access:${C_RESET}\n"
 printf "    Control Panel:  ${C_YELLOW}http://${SERVER_IP}/cp/${C_RESET}\n"
